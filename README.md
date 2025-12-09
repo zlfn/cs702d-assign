@@ -1,100 +1,317 @@
-# Orbit
-Orbit은 [Doorman](https://github.com/youtube/doorman)과 유사한 글로벌 분산 서버 사이드 레이트리밋 솔루션입니다.
-GPU 클러스터, 외부 API, 데이터베이스 등 공유 리소스에 대한 요청을 UUID 식별자 기반으로 추적하고 제한합니다.
+# Orbit: A Ring-Based Protocol for Global Distributed Rate Limiting
 
-## 풀려고 하는 문제
-분산 서버에서 사용자의 요청이 공유 리소스 (예: GPU 클러스터, 외부 API, 데이터베이스 등)에 접근할 때,
-전체 시스템에 할당된 사용자의 사용량을 초과하지 않도록 적절히 요청을 거절/승인해야합니다.
-* Global cap은 strict합니다. 즉, 어떠한 순간에도 전체 할당량을 초과해서 요청하는 경우가 없어야 합니다.
-* 리소스 요구는 계속 달라질 수 있습니다. 순간적으로 높은 리소스를 요구하더라도, 글로벌 리소스가 남는다면 허용합니다.
+Orbit is a global, distributed, rate limiting protocol, inspired by systems such as [Doorman](https://github.com/youtube/doorman), that enforces **strict global caps** on shared resources. It tracks and limits requests to resources such as GPU clusters, external APIs, and databases based on UUID identifiers.
 
-이를 해결하기 위해 여러가지 방법들이 있습니다.
+---
 
-#### 요청 분산 처리
-먼저, 모든 노드에 특정한 할당량을 미리 분배하는 방법이 있습니다. 
-* 하지만 트래픽 불균형에 매우 취약합니다.
-* Global cap을 지키려면 노드가 많아지면 많아질수록 각 노드가 처리할 수 있는 할당량을 매우 낮게 설정해야 합니다.
+## 1. Problem Statement
 
-Consistent Hashing, Rendezvous Hashing 등을 이용해 요청을 여러 서버에 고르게 분산시키는 방법도 있습니다.
-* 각 서버가 자신에게 할당된 UUID의 요청만 처리하도록 합니다.
-* 그러나, 특정 UUID에 대한 요청이 한 서버에 몰리는 경우, 해당 서버가 과부하가 걸릴 수 있습니다.
+In a distributed server environment, user requests compete for shared resources (e.g., GPU clusters, external APIs, databases). The system must **accept or reject** each request such that:
 
-#### 중앙 서버 방식
-먼저 중앙 집중형 레이트리밋 서버를 두는 방법이 있습니다.
-* 모든 요청이 중앙 서버를 거치게 하여 전체 사용량을 추적하고 관리합니다.
-* 그러나, 중앙 서버가 병목이 되고, 장애 지점이 됩니다. (Single Point Of Failure)
+- The user’s total usage across the **entire system** never exceeds the global allocation.
+- The **global cap is strict**: at no point in time may the aggregated usage exceed the configured limit.
+- Resource demands may fluctuate rapidly. Even short-lived high-demand bursts should be allowed as long as sufficient global capacity remains.
 
-중앙 서버가 다운될 경우를 대비해 Raft 등 분산합의 프로토콜을 이용한 Leader 선출을 사용하는 방법도 있습니다. (예: Doorman)
-* 하지만 여전히 클라이언트들의 전체 할당량을 관리하는 단 하나의 Leader가 생기게 됩니다.
-  - 재선출 과정을 거치겠지만, Leader가 재선출되고 할당량을 "학습" 하는 동안 전체 서버에 장애가 발생할 것입니다.
+Formally, the system must guarantee that the instantaneous sum of consumed capacity over all nodes does not exceed a global cap, while operating in a distributed setting with no single point of control and under realistic network conditions.
 
-또한, 중앙 서버를 두는 방식의 치명적인 문제점은 네트워크 지연 시간입니다
-모든 요청이 중앙 서버를 거치게 되므로, 네트워크 왕복 시간이 전체 요청 지연 시간에 큰 영향을 미칩니다.
-특히, 글로벌 분산 서버의 경우, 중앙 서버와의 물리적 거리가 멀어질수록 지연 시간이 커집니다.
+Multiple approaches have been proposed to solve this problem; however, each approach has significant drawbacks when we require **global strictness, low latency, and high availability** simultaneously.
 
-토큰 예약을 통해 중앙 서버와의 통신 횟수를 줄이는 방법도 있습니다.
-* 클라이언트가 미리 토큰을 예약하여 일정량의 요청을 중앙 서버와 통신하지 않고 처리할 수 있습니다.
-* 그러나, 트래픽의 정밀한 제어와 효율성이 떨어집니다.
-* 또한, 여전히 중앙 서버가 단일 장애 지점으로 남아있습니다.
+---
 
-#### 분산 합의 방식
-CRDT (Conflict-free Replicated Data Type)를 이용한 분산 합의 방법이 있습니다.
-* 모든 노드가 각자의 할당량 테이블을 가지고 있고, 주기적으로 다른 노드들과 테이블을 교환하여 합의에 도달합니다.
-* 그러나, 전체 할당량을 엄격히 지키는 것이 불가능합니다. (Eventual consistency)
-* 동기화를 위해 많은 네트워크 통신이 필요합니다 (Gassip protocol)
+## 2. Existing Approaches
 
-이를 해결하기 위한 Bounded Counter CRDT (Escrow) 방법도 제안되었습니다.
-* 전체 할당량을 여러 노드가 나누어 갖고, 부족할때만 서로 비동기적으로 토큰을 이체합니다.
-* 하지만, 노드간의 통신량이 많아지고, 자원 파편화로 인한 비효율이 발생할 수 있습니다.
+### 2.1 Static Quota Distribution
 
-CMDRL (Markovian Distributed Rate Limiting), PBFT (Prediction Based Fair Token Bucket Algorithm) 등 사용량 예측과 확률적 접근법도 제안되었습니다.
-* 그러나, 예측이 빗나가는 경우 전체 할당량을 초과하는 상황이 발생할 수 있습니다.
-* 또한, 확률적 접근법은 엄격한 글로벌 캡을 보장하지 못하고, 비즈니스 로직상의 엄격한 제한이 필요한 경우 적합하지 않습니다.
+One straightforward method is to statically partition the global capacity across all nodes in advance.
 
-이러한 문제를 해결하기 위해 **Orbit** 프로토콜을 제안합니다.
+- Each node is assigned a fixed quota and independently enforces a local limit.
+- Requests are admitted or rejected based solely on the node’s local quota.
 
-## Orbit Protocol
-Orbit은 Doorman과 다른 방법으로 전체 레이트리밋 문제를 해결합니다.
+However, this approach has substantial limitations:
 
-* 모든 노드를 링 모양으로 연결합니다. 각각의 노드는 바로 이전 노드, 바로 다음 노드와 통신하게 됩니다.
-* 하나의 마스터를 선출하는 대신, 각 노드가 매 에포크마다 UUID별 사용량을 추적하고, 이전 노드들의 사용량 정보를 Pull 받습니다.
-* 각 노드는 이전 노드들의 사용량 합계를 기반으로 자신이 사용할 수 있는 할당량을 계산합니다.
-* 자신이 사용한 양과 이전 노드들의 사용량을 합쳐서 다음 노드가 Pull 할 수 있도록 제공합니다.
-* 각 에포크는 수신 페이즈와 송신 페이즈로 구분됩니다. 수신 페이즈에서 이전 노드로부터 사용량 테이블을 Pull 받고, 송신 페이즈에서 다음 노드에 테이블을 제공합니다.
+- It is highly vulnerable to **traffic imbalance**. Nodes with low traffic waste their assigned capacity, while hot nodes become overloaded despite remaining global capacity.
+- To preserve the global cap in the worst case, the per-node quota must be set conservatively. As the number of nodes grows, each node’s quota must shrink, leading to **poor overall resource utilization**.
 
-Orbit은 다음과 같은 특징이 있습니다.
-* **중앙 병목 및 SPoF의 구조적 제거** : 중앙 서버가 없으므로, 단일 장애 지점이 없고, 각 노드가 독립적으로 동작합니다.
-* **엄격한 글로벌 캡 보장** : 각 노드는 이전 노드들의 사용량을 기반으로 할당량을 계산하므로, 전체 시스템의 사용량이 어떠한 시점에도 글로벌 캡을 초과하지 않습니다.
-  CMDRL, PBFT와 달리 예측이나 확률적 접근법을 사용하지 않으므로, 엄격한 제한이 필요한 비즈니스 로직에 적합합니다.
-* **각 노드의 낮은 지연 시간** : 각 노드는 자신이 현재 가지고 있는 정보만으로 할당량을 계산하므로, 모든 요청에 다른 노드와 통신할 필요가 없습니다.
-  통신은 에포크 단위로 동기적으로 이루어집니다.
-* **네트워크 토폴로지의 단순성** : Full Mesh 통신이 아니라 Ring 구조 통신이므로, 노드 수가 늘어나도 각 노드의 네트워크 연결 부하가 일정합니다.
+### 2.2 Hash-Based Request Sharding
 
-## 예상되는 문제 & 해결법
-* **바로 이전 노드가 사용량을 독점하면, 다음 노드는 최대 사용량이 매우 낮아진다** :
-  - 각 노드가 남은 용량의 `rollover_ratio%` 만큼을 다음 노드를 위해 예약하여 할당량이 계속 전달되도록 합니다.
-  - `rollover_ratio`가 낮으면 리소스를 효율적으로 사용할 수 있지만, 특정 노드가 할당량을 독점할 가능성이 높아지고,
-  - `rollover_ratio`가 높으면 노드들이 전체 할당량을 고르게 나누어 사용할 수 있지만, 리소스 활용률이 떨어집니다.
-* **에포크 사이사이에 요청을 보내지 못하는 공백이 생긴다.** :
-  - 각 노드는 이전 노드에서 정보를 받지 못하더라도 각 에포크에서 어느정도의 사용량을 항상 허용하도록 합니다. (local fixed window)
-  - 에포크 전환 시 로컬 사용량이 남아있다면, 해당 사용량을 먼저 사용하고, 남아있지 않다면 이전 노드로부터 정보를 받을 때까지 대기합니다.
-* **특정 노드가 다운되거나 네트워크가 단절되면 어떻게 되는가?** :
-  - 이전 노드로부터 사용량 테이블을 받지 못하는 경우, 그 이전 노드에 정보를 다시 요청합니다. (Virtual Ring)
-  - 각 노드는 딱 하나의 노드로만 정보를 전송하도록 설계되어 있고, 네트워크 단절 상태에 따라 동적으로 정보 전달 경로가 다시 설정됩니다.
-  - 어떤 노드로부터도 정보를 받지 못하고 있는 경우, 로컬 고정 윈도우에서만 할당량을 사용하고, 해당 에포크에는 다음 노드로 정보를 전송하지 않습니다.
-* **매우 큰 데이터의 사용량 테이블 전송** :
-  - 현재 에포크의 사용자 수가 10만~100만명 단위로 매우 큰 경우, 각 에포크의 Serialization / Deserialization 비용과 네트워크 전송 비용이 커질 수 있습니다.
-  - 이를 효과적으로 해결할 방법은 없습니다. Global cap을 보장하는 프로토콜의 한계로, 전체 사용량 정보를 모든 노드가 공유해야 하기 때문입니다.
-  - Serialization / Deserialization을 수행하지 않는 Cap'n Proto, Flatbuffers 등의 이진 포맷을 사용하거나, Rkyv 등의 Zero-Copy 직렬화 라이브러리를 사용하는 방법이 있습니다.
-  - 네트워크의 경우 사용자 100만명, 노드 10개 수준의 경우 100MB 정도의 데이터가 매 에포크마다 순환합니다. 일반적인 데이터센터 네트워크 환경에서는 감당할 수 있는 수준입니다.
+Another approach is to use Consistent Hashing or Rendezvous Hashing to distribute requests across nodes:
 
-## 프로토콜의 한계
-- **레이트리밋 윈도우의 최소 시간이 `에포크시간 × 노드개수`로 제한됩니다.** 즉, Orbit은 긴 기간 (분~시간단위) 동안의 평균 사용량이 일정 이하임을 보장할 수 있지만, 짧은 시간동안 요청이 몰려들어오는 것은 방지할 수 없습니다.
-  이는 분산 처리 시스템의 한계로, 각 노드가 요청을 처리하기 전에는 모든 노드의 현재 정보를 가질 수 없으므로, Orbit 시스템만으로는 이 문제를 해결할 수 없습니다.
-  이를 해결하기 위해서 각 노드에서 로컬 레이트리밋 알고리즘을 2차적으로 적용해 순간적인 burst를 방지할 수 있도록 보완이 필요합니다.
+- Each request is mapped to a node based on its UUID.
+- Each node is responsible only for rate limiting the UUIDs it owns.
 
-## Resources
-* [Doorman - Global Distributed Client Side Rate Limiting](https://github.com/youtube/doorman)
-* [High-throughput distributed rate limiter](https://engineering.linecorp.com/en/blog/high-throughput-distributed-rate-limiter)
-* [Extending Eventually Consistent Cloud Databases for Enforcing Numeric Invariants](https://ieeexplore.ieee.org/abstract/document/7371565)
-* [CMDRL: A Markovian Distributed Rate Limiting Algorithm in Cloud Networks](https://dl.acm.org/doi/abs/10.1145/3663408.3663417)
+This method smooths load across nodes on average, but:
+
+- If a particular UUID experiences a sudden spike in traffic, the corresponding node can still be overloaded.
+- Enforcing a strict global cap across all nodes remains non-trivial, as each node’s view is inherently local.
+
+### 2.3 Centralized Rate Limiting
+
+A common design is to introduce a **centralized rate limiting server**:
+
+- All requests (or at least all rate-limiting decisions) pass through a single central node.
+- The central node tracks global usage and enforces the cap exactly.
+
+This design is simple and precise, but it introduces serious issues:
+
+- The central server becomes a **bottleneck** for throughput.
+- It is a **single point of failure (SPoF)**.
+
+To mitigate failures, distributed consensus protocols such as Raft can be used for leader election (e.g., Doorman-style designs):
+
+- A leader is elected to act as the central authority.
+- Upon leader failure, a new leader is elected.
+
+However:
+
+- There is still effectively **a single logical leader** that manages global quotas.
+- During leader re-election and state recovery, the system can encounter **availability issues** and temporarily inconsistent quotas.
+- Network round-trip latency to the leader significantly impacts request latency. In globally distributed deployments, the physical distance to the leader directly increases end-to-end tail latency.
+
+#### Token Reservation
+
+To reduce frequent communication with the central server, clients may **reserve tokens**:
+
+- Clients periodically obtain a batch of tokens from the central server.
+- Local requests are admitted against the reserved tokens without contacting the server each time.
+
+This approach lowers communication overhead but:
+
+- Reduces the **granularity** and **accuracy** of traffic control.
+- Still preserves the central authority as a bottleneck and a single point of failure.
+
+### 2.4 Distributed Agreement and CRDT-Based Approaches
+
+CRDTs (Conflict-free Replicated Data Types) can be used to build distributed counters:
+
+- Each node maintains its own copy of a usage table.
+- Nodes periodically exchange and merge tables, converging towards a consistent global state (eventual consistency).
+
+However:
+
+- Due to **eventual** rather than strong consistency, these systems **cannot guarantee strict global caps** at all times.
+- Gossip-style synchronization requires substantial network communication, especially as the number of nodes grows.
+
+To address numeric invariants under eventual consistency, **Bounded Counter CRDTs (Escrow)** have been proposed:
+
+- The global capacity is split into tokens distributed across nodes.
+- Nodes transfer tokens asynchronously between each other when they run low.
+
+This helps enforce numeric invariants, but:
+
+- Inter-node communication volume can be large.
+- Capacity fragmentation leads to inefficiencies and underutilization.
+
+### 2.5 Prediction- and Probability-Based Methods
+
+Algorithms such as CMDRL (Markovian Distributed Rate Limiting) and PBFT (Prediction Based Fair Token Bucket Algorithm) use predictive or probabilistic methods:
+
+- Future usage is estimated using stochastic models.
+- Rates are probabilistically throttled to approximate adherence to the global cap.
+
+However:
+
+- When predictions are inaccurate, the system may **overshoot** the global cap.
+- Probabilistic guarantees are not suitable for workloads requiring **hard business constraints** (e.g., strict cost ceilings, regulatory limits).
+
+---
+
+## 3. The Orbit Protocol
+
+To address the above limitations, we propose the **Orbit protocol**.
+
+Orbit solves global rate limiting **without a centralized master** and **without probabilistic guarantees**, while providing:
+
+- Strict global caps,
+- Bounded and predictable communication patterns, and
+- Low local request latency.
+
+### 3.1 High-Level Design
+
+Orbit connects all nodes into a **logical ring**:
+
+- Each node communicates only with its **immediate predecessor** and **immediate successor** in the ring.
+- There is **no elected master** or central coordinator.
+
+Each epoch is divided into two phases:
+
+1. **Receive Phase (Pull)**  
+   The node pulls the cumulative usage table from its predecessor.
+2. **Send Phase (Push)**  
+   The node updates the cumulative usage table with its own usage and makes it available to its successor.
+
+Within each epoch:
+
+- Each node tracks UUID-specific usage locally.
+- At the beginning (or during) the epoch, a node receives the cumulative usage of all **previous nodes in the ring**.
+- Based on this cumulative usage and the global cap, the node computes the remaining capacity available to itself.
+- The node admits or rejects incoming requests according to this available capacity, **without contacting other nodes** on a per-request basis.
+- The node aggregates its own usage into the cumulative table and passes it onward to the next node.
+
+In effect, the ring maintains a **cumulative (prefix) sum** of usage across nodes, circulating once per epoch.
+
+### 3.2 Key Properties
+
+Orbit exhibits the following properties:
+
+- **Elimination of Central Bottlenecks and SPoF**  
+  There is no central server. Each node operates independently, and the topology is inherently decentralized.
+
+- **Strict Global Cap Guarantee**  
+  Each node computes its allocable capacity based on the **sum of all prior usage** in the ring. As a result, the total usage across all nodes can never exceed the global cap at any point in time, assuming correct operation of the protocol.
+
+  Unlike CMDRL or PBFT, Orbit does not rely on prediction or probabilistic models; it relies on explicit cumulative accounting.
+
+- **Low Per-Request Latency**  
+  Nodes make rate limiting decisions using only local state and last received cumulative information. No inter-node communication is required on the critical path of a single request.
+
+- **Simple Network Topology**  
+  Communication is limited to a ring rather than a full mesh. Each node maintains a constant number of connections irrespective of the total number of nodes.
+
+---
+
+## 4. Anticipated Challenges and Mitigation Strategies
+
+### 4.1 Predecessor Dominance (Capacity Monopolization)
+
+**Problem.**  
+If a node close to the beginning of the ring consumes most of the available capacity, downstream nodes may see very little remaining capacity and effectively starve.
+
+**Mitigation.**  
+Introduce a configurable **`rollover_ratio`**:
+
+- Each node reserves a fixed percentage of the remaining capacity for downstream nodes.
+- For example, if a node observes `remaining_capacity` and `rollover_ratio = r`, it may only consume up to `(1 - r) * remaining_capacity`, reserving `r * remaining_capacity` for subsequent nodes.
+
+This creates a trade-off:
+
+- Lower `rollover_ratio`  
+  → Higher utilization but greater risk of capacity monopolization by early nodes.
+- Higher `rollover_ratio`  
+  → Improved fairness and more balanced capacity distribution, but potential decrease in overall utilization.
+
+### 4.2 Gaps Between Epochs
+
+**Problem.**  
+Between epochs, or before a node has received updated information from its predecessor, it may not know exactly how much global capacity remains. Naively, this could force the node to stall all traffic until the next cumulative update arrives.
+
+**Mitigation.**
+
+- Each node maintains a **local fixed window** allowance for each epoch.
+- Even without updated information from the predecessor, a node can admit requests up to this local allowance.
+- When an epoch boundary is reached:
+  - If local allowance is not fully used, the remaining local budget is carried forward as a local buffer.
+  - If there is no remaining allowance and updated information is not yet available, the node may temporarily wait until it receives the new cumulative usage table.
+
+This mechanism smooths out brief communication delays while still preserving overall strictness over the configured time scales.
+
+### 4.3 Node Failures and Network Partitions
+
+**Problem.**  
+If a node fails or becomes unreachable, the ring structure is temporarily broken.
+
+**Mitigation.**
+
+- Orbit implements a **Virtual Ring**:
+  - If a node cannot obtain usage information from its immediate predecessor, it retries with the predecessor’s predecessor, recursively, effectively skipping failed nodes.
+  - Each node sends information to exactly one successor; when links fail, the ring is re-routed dynamically to maintain a single successor per node.
+
+- If a node cannot obtain information from any predecessor (e.g., in a severe partition):
+  - The node falls back to using **only its local fixed window** allowance.
+  - In that epoch, it does not forward any cumulative information downstream.
+
+This design allows the system to degrade gracefully under partial failures while avoiding uncontrolled overshoot of the global cap.
+
+### 4.4 Large Usage Tables
+
+**Problem.**  
+When the number of active users per epoch is very large (e.g., 100,000–1,000,000 UUIDs), maintaining and transmitting full usage tables per epoch can be expensive:
+
+- Serialization and deserialization overhead,
+- Network bandwidth consumption.
+
+**Mitigation.**
+
+Fundamentally, any protocol that enforces a strict global cap requires all nodes to share sufficient information about global usage. This imposes a lower bound on the amount of state that must circulate.
+
+However, the practical overhead can be mitigated through:
+
+- Efficient binary formats that avoid repeated serialization overhead, such as **Cap’n Proto**, **FlatBuffers**, or **Rkyv** (zero-copy serialization).
+- Incremental or delta-encoding of usage tables (e.g., only transmitting entries that changed in the last epoch).
+- Exploiting typical datacenter network characteristics: for example, in a deployment with 1 million users and 10 nodes, approximately 100 MB of data circulating per epoch is often acceptable in a modern datacenter environment.
+
+---
+
+## 5. Limitations of the Protocol
+
+Despite its advantages, Orbit has inherent limitations that arise from fundamental constraints in distributed systems.
+
+### 5.1 Minimum Effective Rate Limit Window
+
+Orbit’s minimal effective rate limiting window is bounded by:
+
+> **`epoch_duration × number_of_nodes`**
+
+That is, Orbit can guarantee that **average usage** over relatively long intervals (e.g., minutes to hours) does not exceed the configured thresholds, but it cannot prevent extremely short-term bursts at a finer granularity than this bound.
+
+The underlying reason is fundamental:
+
+- Before processing a request, a node cannot possess an up-to-date view of all other nodes’ instantaneous state unless continuous, low-latency synchronization is performed—which is often impractical.
+- Therefore, Orbit alone cannot fully solve ultra-short timescale rate limiting.
+
+**Mitigation.**
+
+- Use Orbit as a **global, long-term** rate limiter.
+- Complement it with **local rate limiting algorithms** (e.g., token bucket, leaky bucket) on each node:
+  - Orbit enforces global constraints over longer windows.
+  - Local limiters suppress short, high-frequency bursts.
+
+### 5.2 Short-Term Consistency vs. Network Delay
+
+Orbit assumes that each node acts based on cumulative information that might be slightly stale within an epoch. While the protocol is designed so that the global cap is never exceeded over the configured time window, **instantaneous microsecond-scale strictness** is not guaranteed when network latency fluctuates.
+
+### 5.3 Fundamental Partition Limitations
+
+In the presence of severe network partitions, no distributed protocol can simultaneously guarantee:
+
+- Strict global caps,
+- High availability,
+- Full partition tolerance.
+
+Orbit biases toward safety: when missing upstream information, nodes fall back to local fixed windows only, which can limit throughput but avoids uncontrolled resource overshoot.
+
+---
+
+## 6. Related Work
+
+- [Doorman – Global Distributed Client Side Rate Limiting](https://github.com/youtube/doorman)  
+  YouTube’s centralized rate limiting service using a leader-based design.
+
+- [High-throughput distributed rate limiter](https://engineering.linecorp.com/en/blog/high-throughput-distributed-rate-limiter)  
+  Engineering notes from LINE on building high-throughput rate limiters.
+
+- [Extending Eventually Consistent Cloud Databases for Enforcing Numeric Invariants](https://ieeexplore.ieee.org/abstract/document/7371565)  
+  Discusses Bounded Counter CRDTs (Escrow techniques) for numeric invariants under eventual consistency.
+
+- [CMDRL: A Markovian Distributed Rate Limiting Algorithm in Cloud Networks](https://dl.acm.org/doi/abs/10.1145/3663408.3663417)  
+  Proposes a Markovian model-based distributed rate limiting algorithm with probabilistic guarantees.
+
+---
+
+## 7. Conclusion
+
+Orbit introduces a **ring-based, master-less protocol** for global distributed server-side rate limiting that:
+
+- Eliminates central bottlenecks and single points of failure,
+- Provides **strict global cap** guarantees without probabilistic approximations,
+- Achieves low per-request latency by making decisions locally,
+- Maintains a simple and scalable communication topology, and
+- Degrades gracefully under node failures and network partitions.
+
+By combining Orbit with local rate limiting at each node, systems can enforce both **global long-term constraints** and **short-term burst control**, making Orbit particularly suitable for:
+
+- GPU clusters and inference workloads,
+- External APIs with strict cost or quota constraints,
+- Databases and other shared backend resources where overshoot is unacceptable,
+- Globally distributed systems where centralized rate limiting is operationally expensive.
+
+Orbit thus occupies a design space between centralized leader-based systems and purely eventually consistent approaches, offering a practical and robust solution for strict, global rate limiting in large-scale distributed environments.
